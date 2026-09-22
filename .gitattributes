@@ -1,0 +1,4 @@
+# Evita que Windows introduzca saltos de linea CRLF en los archivos de texto.
+* text=auto eol=lf
+*.md text eol=lf
+*.py text eol=lf

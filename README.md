@@ -244,5 +244,3 @@ que el navegador del usuario no altere el contraste.
 | [.streamlit/config.toml](.streamlit/config.toml) | Tema visual. |
 | [.env.example](.env.example) | Plantilla de variables locales. |
 | [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example) | Plantilla de variables en la nube. |
-#   L a b o r e s _ M a q u i n a r i a  
- 

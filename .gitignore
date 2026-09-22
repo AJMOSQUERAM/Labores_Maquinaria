@@ -1,0 +1,13 @@
+# Credenciales: nunca deben subirse al repositorio
+.env
+.streamlit/secrets.toml
+
+# Configuración interna de la base de datos: se conserva en local, no se publica
+supabase_politicas_lectura.sql
+
+# Archivos de trabajo que no hacen parte de la app
+*.pbix
+Flujo de N8N para enviar correo/
+
+__pycache__/
+*.pyc

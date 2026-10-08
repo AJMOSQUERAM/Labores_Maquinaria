@@ -5,6 +5,9 @@
 # Configuración interna de la base de datos: se conserva en local, no se publica
 supabase_politicas_lectura.sql
 
+# Exportaciones de datos: nunca deben publicarse
+*.csv
+
 # Archivos de trabajo que no hacen parte de la app
 *.pbix
 Flujo de N8N para enviar correo/

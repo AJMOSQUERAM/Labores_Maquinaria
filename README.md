@@ -47,7 +47,7 @@ Streamlit re-ejecuta `app.py` completo en cada interacción. El orden importa:
 5. **Enriquecimiento** — `agregar_actividades()` traduce el código de labor.
 6. **Validación** — `marcar_alertas()` produce la matriz booleana de reglas.
 7. **Filtros** — la barra lateral recorta el DataFrame a `filtrados`.
-8. **Render** — tres pestañas: Resumen, Detalle, Calidad de datos.
+8. **Render** — tres pestañas: Detalle, Resumen, Calidad de datos.
 
 Todo lo que se dibuja parte de `filtrados`; `datos` conserva el conjunto
 completo para los contadores del encabezado.
@@ -101,15 +101,39 @@ Supabase; no forman parte de este repositorio.
 
 ## Caché
 
+### Datos (`cache_data`)
+
 | Función | TTL | Clave de caché |
 |---|---|---|
-| `cargar_registros` | 300 s | `(tabla, token)` |
-| `cargar_actividades` | 1800 s | `(tabla, token)` |
+| `cargar_registros` | 300 s | `(tabla, usuario_id)` |
+| `cargar_actividades` | 3600 s | `(tabla, códigos presentes, usuario_id)` |
 
-El token forma parte de la clave a propósito: evita que un usuario reciba datos
-traídos con las credenciales de otro. Como el token rota en cada renovación, la
-caché se invalida al menos una vez por hora, lo cual es aceptable con estos
-volúmenes.
+El `usuario_id` forma parte de la clave para que un usuario no reciba datos
+traídos con las credenciales de otro. El **token no entra en la clave**: se pasa
+como `_token` y Streamlit ignora los argumentos que empiezan con guion bajo. Es
+deliberado — el token rota cada hora, y si formara parte de la clave invalidaría
+la caché en cada rotación.
+
+`cargar_actividades` recibe la tupla de códigos que de verdad aparecen en los
+registros y los pide con `.in_()`. Traer la maestra completa son ~1600 filas en
+dos páginas (~800 ms); así es una sola petición (~190 ms). La caché se renueva
+sólo cuando aparece un código nuevo.
+
+### Conexiones (`cache_resource`)
+
+`create_client()` cuesta ~380 ms la primera vez y ~180 ms después, así que no se
+crea por consulta:
+
+- `_cliente_anonimo()` — uno por proceso, para las operaciones de Auth.
+- `_cliente_sesion(usuario_id)` — uno por usuario, reutilizado entre reruns. El
+  token tampoco entra en esta clave; `_cliente()` lo adjunta en cada uso con
+  `postgrest.auth()`, que sólo reescribe una cabecera.
+
+### Consultas
+
+`COLUMNAS_CONSULTA` limita el `SELECT` a los campos que se usan: las columnas
+internas (`id_registro`, `fecha_original`, `telegram_chat_id`,
+`telegram_usuario`) no viajan por la red.
 
 `_descargar()` pagina de 1000 en 1000 hasta agotar la tabla, así que no depende
 del límite por defecto de PostgREST.
@@ -134,7 +158,7 @@ El botón **Actualizar datos** llama a `st.cache_data.clear()`.
 | `horometro_inicio`, `horometro_final`, `horometro_diferencia` | numérico | |
 | `horas_trabajadas`, `area_trabajada` | numérico | Acepta coma o punto decimal. |
 | `observaciones` | texto | |
-| `registrado_en` | datetime | Llega en UTC; se resta 5 h fijas para hora de Colombia. |
+| `registrado_en` | datetime | Llega en UTC; se resta 5 h fijas para hora de Colombia. Se muestra como *Fecha digitación*. |
 
 Las columnas internas de la tabla (`id_registro`, `fecha_original`,
 `telegram_chat_id`, `telegram_usuario`) se cargan pero nunca se muestran: la
@@ -186,10 +210,15 @@ regla sin descripción no se muestra.
 
 ## Gráficos
 
-Dos constructores, ambos con el mismo tratamiento visual:
+Dos constructores sobre `plotly.graph_objects`, ambos con el mismo tratamiento
+visual:
 
 - `barras_horizontales()` — magnitudes por categoría.
 - `barras_por_dia()` — serie temporal.
+
+Se usa `graph_objects` y no `plotly.express` a propósito: `express` tarda ~250 ms
+en importarse contra ~70 ms de `graph_objects`, y en un contenedor que arranca en
+frío cada vez que la app despierta, ese tiempo se paga en cada visita.
 
 Decisiones que conviene no revertir sin motivo:
 

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -43,10 +43,21 @@ SUPABASE_TABLA = _config("SUPABASE_TABLE", defecto="registro_labores_maquinaria"
 # Maestra de labores: el campo `labor` de cada registro es el código de la actividad.
 ACTIVIDADES_TABLA = _config("SUPABASE_ACTIVIDADES_TABLE", defecto="actividades")
 
-# Paleta validada para fondo claro: slot 1 azul, slot 2 naranja, slot 3 aqua.
-AZUL = "#2a78d6"
-NARANJA = "#eb6834"
-AQUA = "#1baf7a"
+# Paleta de marca, validada para fondo claro.
+#
+# VERDE es el color institucional y pinta todas las barras de magnitud: al ser
+# series únicas, cada gráfico se distingue por su título y no por el matiz, lo
+# que evita depender del color para leer el dato. Su contraste contra el fondo es
+# 2.21:1, por debajo de 3:1, así que las barras llevan siempre su valor escrito
+# al lado y existe la vista de tabla en Detalle.
+#
+# VERDE_OSCURO es el único que admite texto blanco encima (5.1:1); sobre VERDE el
+# texto va oscuro (8.7:1), nunca blanco.
+#
+# ROJO queda reservado para estado (alertas) y no se usa como color de serie.
+VERDE = "#7DBE00"
+VERDE_OSCURO = "#4e7a00"
+VERDE_TENUE = "#eff7e0"
 ROJO = "#e34948"
 TINTA = "#0b0b0b"
 TINTA_SUAVE = "#52514e"
@@ -75,8 +86,20 @@ ETIQUETAS = {
     "horometro_diferencia": "Δ Horómetro",
     "tiene_observaciones": "Con observación",
     "observaciones": "Observaciones",
-    "registrado_en": "Registrado en",
+    "registrado_en": "Fecha digitación",
 }
+
+FORMATO_FECHA = "%d/%m/%Y"  # fecha y fecha de digitación se muestran igual
+
+# Columnas que se piden a la base. Se excluyen las internas (id_registro,
+# fecha_original, telegram_chat_id, telegram_usuario): no se muestran nunca.
+COLUMNAS_CONSULTA = ",".join([
+    "ficha", "nombre_completo", "ip_equipo", "tiene_implemento",
+    "cantidad_implementos", "implemento_1", "implemento_2", "fecha",
+    "area_trabajada", "hora_inicio", "horometro_inicio", "hda", "ste", "labor",
+    "hora_final", "horometro_final", "horas_trabajadas", "horometro_diferencia",
+    "tiene_observaciones", "observaciones", "registrado_en",
+])
 
 COLUMNAS_NUMERICAS = [
     "cantidad_implementos",
@@ -198,18 +221,37 @@ def normalizar(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _cliente(token: str | None = None):
-    """Cliente de Supabase. Con token, las consultas viajan como usuario autenticado."""
+@st.cache_resource(show_spinner=False)
+def _cliente_anonimo():
+    """Cliente sin sesión, para las operaciones de Auth.
+
+    `create_client` cuesta ~380 ms, así que se crea una sola vez por proceso.
+    """
     from supabase import create_client
 
-    cliente = create_client(SUPABASE_URL, SUPABASE_KEY)
-    if token:
-        cliente.postgrest.auth(token)
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+@st.cache_resource(show_spinner=False, max_entries=20)
+def _cliente_sesion(usuario_id: str):
+    """Un cliente por usuario, reutilizado entre reruns.
+
+    El token NO forma parte de la clave porque rota cada hora; se adjunta en
+    cada uso con `postgrest.auth()`, que sólo reescribe la cabecera.
+    """
+    from supabase import create_client
+
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def _cliente(usuario_id: str, token: str):
+    cliente = _cliente_sesion(usuario_id)
+    cliente.postgrest.auth(token)
     return cliente
 
 
-def _descargar(tabla: str, token: str, columnas: str = "*") -> pd.DataFrame:
-    cliente = _cliente(token)
+def _descargar(tabla: str, usuario_id: str, token: str, columnas: str = "*") -> pd.DataFrame:
+    cliente = _cliente(usuario_id, token)
     filas: list[dict] = []
     tamano, pagina = 1000, 0
     while True:
@@ -228,13 +270,29 @@ def _descargar(tabla: str, token: str, columnas: str = "*") -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cargar_registros(tabla: str, token: str) -> pd.DataFrame:
-    return _descargar(tabla, token)
+def cargar_registros(tabla: str, usuario_id: str, _token: str) -> pd.DataFrame:
+    """Registros del usuario. `_token` lleva guion bajo para quedar fuera de la
+    clave de caché: así la rotación horaria del token no obliga a recargar."""
+    return _descargar(tabla, usuario_id, _token, COLUMNAS_CONSULTA)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cargar_actividades(tabla: str, token: str) -> pd.DataFrame:
-    maestro = _descargar(tabla, token, "codigo,nome")
+@st.cache_data(ttl=3600, show_spinner=False)
+def cargar_actividades(
+    tabla: str, codigos: tuple[str, ...], usuario_id: str, _token: str
+) -> pd.DataFrame:
+    """Sólo los nombres de los códigos presentes en los registros.
+
+    La maestra tiene ~1600 filas (dos páginas, ~800 ms). Pidiendo los códigos
+    que de verdad aparecen, una página basta (~190 ms).
+    """
+    if not codigos:
+        return pd.DataFrame(columns=["codigo", "nome"])
+
+    cliente = _cliente(usuario_id, _token)
+    respuesta = (
+        cliente.table(tabla).select("codigo,nome").in_("codigo", list(codigos)).execute()
+    )
+    maestro = pd.DataFrame(respuesta.data or [])
     if maestro.empty:
         return maestro
     maestro["codigo"] = maestro["codigo"].astype(str).str.strip()
@@ -242,7 +300,7 @@ def cargar_actividades(tabla: str, token: str) -> pd.DataFrame:
     return maestro.drop_duplicates(subset="codigo")
 
 
-def agregar_actividades(df: pd.DataFrame, token: str) -> pd.DataFrame:
+def agregar_actividades(df: pd.DataFrame, usuario_id: str, token: str) -> pd.DataFrame:
     """Traduce el código de `labor` al nombre de la actividad usando la tabla maestra."""
     df = df.copy()
     if "labor" not in df.columns:
@@ -252,8 +310,9 @@ def agregar_actividades(df: pd.DataFrame, token: str) -> pd.DataFrame:
     codigos = df["labor"].astype(str).str.strip()
     df["actividad"] = codigos  # si no hay maestra, al menos se ve el código
 
+    presentes = tuple(sorted(c for c in codigos.unique() if c))
     try:
-        maestro = cargar_actividades(ACTIVIDADES_TABLA, token)
+        maestro = cargar_actividades(ACTIVIDADES_TABLA, presentes, usuario_id, token)
     except Exception as error:  # la app sigue funcionando con el código a la vista
         st.warning(f"No se pudo leer la tabla de actividades: {error}")
         return df
@@ -269,10 +328,10 @@ def agregar_actividades(df: pd.DataFrame, token: str) -> pd.DataFrame:
     return df
 
 
-def obtener_datos(token: str) -> pd.DataFrame:
+def obtener_datos(usuario_id: str, token: str) -> pd.DataFrame:
     """Lee los registros como el usuario autenticado y los deja listos para graficar."""
     try:
-        datos = cargar_registros(SUPABASE_TABLA, token)
+        datos = cargar_registros(SUPABASE_TABLA, usuario_id, token)
     except Exception as error:
         st.error(f"No se pudo consultar la base de datos: {error}")
         return pd.DataFrame()
@@ -285,7 +344,7 @@ def obtener_datos(token: str) -> pd.DataFrame:
         )
         return pd.DataFrame()
 
-    return agregar_actividades(normalizar(datos), token)
+    return agregar_actividades(normalizar(datos), usuario_id, token)
 
 
 # --------------------------------------------------------------------------- #
@@ -301,12 +360,13 @@ def _guardar_sesion(respuesta) -> None:
         "refresh_token": sesion.refresh_token,
         "expira_en": float(sesion.expires_at or 0),
         "correo": getattr(respuesta.user, "email", ""),
+        "id": getattr(respuesta.user, "id", ""),
     }
 
 
 def cerrar_sesion() -> None:
     try:
-        _cliente().auth.sign_out()
+        _cliente_anonimo().auth.sign_out()
     except Exception:  # cerrar la sesión local es lo que importa
         pass
     st.session_state.pop("sesion", None)
@@ -316,7 +376,7 @@ def cerrar_sesion() -> None:
 def iniciar_sesion(correo: str, contrasena: str) -> str | None:
     """Devuelve un mensaje de error, o None si la sesión quedó abierta."""
     try:
-        respuesta = _cliente().auth.sign_in_with_password(
+        respuesta = _cliente_anonimo().auth.sign_in_with_password(
             {"email": correo.strip().lower(), "password": contrasena}
         )
     except Exception as error:
@@ -342,7 +402,7 @@ def token_activo() -> str | None:
         return None
     if sesion["expira_en"] and time.time() > sesion["expira_en"] - MARGEN_REFRESCO:
         try:
-            _guardar_sesion(_cliente().auth.refresh_session(sesion["refresh_token"]))
+            _guardar_sesion(_cliente_anonimo().auth.refresh_session(sesion["refresh_token"]))
         except Exception:
             st.session_state.pop("sesion", None)
             return None
@@ -350,14 +410,15 @@ def token_activo() -> str | None:
 
 
 def pantalla_ingreso() -> None:
-    _, centro, _ = st.columns([1, 2, 1])
+    _, centro, _ = st.columns([1, 1.6, 1])
     with centro:
-        st.title("Labores de maquinaria")
-        st.caption("Ingrese con el usuario que le asignaron para consultar los registros.")
-        with st.form("ingreso"):
-            correo = st.text_input("Correo")
-            contrasena = st.text_input("Contraseña", type="password")
-            enviar = st.form_submit_button("Ingresar", width="stretch")
+        st.write("")
+        with st.container(border=True):
+            encabezado_marca("Ingrese con el usuario que le asignaron.")
+            with st.form("ingreso", border=False):
+                correo = st.text_input("Correo", placeholder="nombre@empresa.com")
+                contrasena = st.text_input("Contraseña", type="password", placeholder="••••••••")
+                enviar = st.form_submit_button("Ingresar", width="stretch")
         if enviar:
             if not correo or not contrasena:
                 st.error("Escriba el correo y la contraseña.")
@@ -411,20 +472,22 @@ def _estilo(fig, titulo: str, alto: int) -> None:
 
 
 def barras_horizontales(datos: pd.DataFrame, categoria: str, valor: str, titulo: str,
-                        unidad: str, color: str = AZUL, alto: int | None = None):
+                        unidad: str, color: str = VERDE, alto: int | None = None):
     datos = datos.sort_values(valor, ascending=True)
-    fig = px.bar(datos, x=valor, y=categoria, orientation="h")
-    fig.update_traces(
-        marker_color=color,
-        marker_line_width=0,
-        marker_cornerradius=4,
-        texttemplate="%{x:,.1f}",
-        textposition="outside",
-        textfont=dict(color=TINTA_SUAVE, size=12),
-        cliponaxis=False,
-        hovertemplate="<b>%{y}</b><br>%{x:,.2f} " + unidad + "<extra></extra>",
+    fig = go.Figure(
+        go.Bar(
+            x=datos[valor],
+            y=datos[categoria].astype(str),
+            orientation="h",
+            marker=dict(color=color, line_width=0, cornerradius=4),
+            texttemplate="%{x:,.1f}",
+            textposition="outside",
+            textfont=dict(color=TINTA_SUAVE, size=12),
+            cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>%{x:,.2f} " + unidad + "<extra></extra>",
+        )
     )
-    fig.update_xaxes(showgrid=True, gridcolor=REJILLA, zeroline=False, title=None, ticksuffix="")
+    fig.update_xaxes(showgrid=True, gridcolor=REJILLA, zeroline=False, title=None)
     # type="category" evita que Plotly lea como número los códigos de hacienda o
     # de actividad; automargin evita que se corten las etiquetas largas.
     fig.update_yaxes(
@@ -439,16 +502,17 @@ def barras_horizontales(datos: pd.DataFrame, categoria: str, valor: str, titulo:
 
 
 def barras_por_dia(datos: pd.DataFrame, titulo: str):
-    fig = px.bar(datos, x="fecha", y="horas_trabajadas")
-    fig.update_traces(
-        marker_color=AZUL,
-        marker_line_width=0,
-        marker_cornerradius=4,
-        texttemplate="%{y:,.1f}",
-        textposition="outside",
-        textfont=dict(color=TINTA_SUAVE, size=12),
-        cliponaxis=False,
-        hovertemplate="<b>%{x|%d/%m/%Y}</b><br>%{y:,.2f} horas<extra></extra>",
+    fig = go.Figure(
+        go.Bar(
+            x=datos["fecha"],
+            y=datos["horas_trabajadas"],
+            marker=dict(color=VERDE, line_width=0, cornerradius=4),
+            texttemplate="%{y:,.1f}",
+            textposition="outside",
+            textfont=dict(color=TINTA_SUAVE, size=12),
+            cliponaxis=False,
+            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>%{y:,.2f} horas<extra></extra>",
+        )
     )
     fig.update_xaxes(showgrid=False, title=None, tickformat="%d/%m", dtick="D1")
     fig.update_yaxes(showgrid=True, gridcolor=REJILLA, zeroline=False, title=None)
@@ -474,10 +538,9 @@ def a_csv(tabla: pd.DataFrame) -> bytes:
 def para_mostrar(df: pd.DataFrame, columnas: list[str] | None = None) -> pd.DataFrame:
     columnas = [c for c in (columnas or df.columns) if c in df.columns]
     tabla = df[columnas].copy()
-    if "fecha" in tabla.columns:
-        tabla["fecha"] = tabla["fecha"].dt.strftime("%d/%m/%Y")
-    if "registrado_en" in tabla.columns:
-        tabla["registrado_en"] = tabla["registrado_en"].dt.strftime("%d/%m/%Y %H:%M")
+    for columna in ("fecha", "registrado_en"):
+        if columna in tabla.columns:
+            tabla[columna] = tabla[columna].dt.strftime(FORMATO_FECHA)
     return tabla.rename(columns=ETIQUETAS)
 
 
@@ -486,18 +549,165 @@ def para_mostrar(df: pd.DataFrame, columnas: list[str] | None = None) -> pd.Data
 # --------------------------------------------------------------------------- #
 st.set_page_config(page_title="Labores de maquinaria", page_icon="🚜", layout="wide")
 
-st.markdown(
-    """
-    <style>
-      div[data-testid="stMetricValue"] { font-size: 1.7rem; }
-      div[data-testid="stMetric"] {
-        background: #ffffff; border: 1px solid #eceae5;
-        border-radius: 10px; padding: 12px 16px;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# Hoja de estilos. Los selectores por data-testid son los puntos de enganche de
+# Streamlit; si alguno cambia de nombre en una versión futura, la regla
+# simplemente deja de aplicar y la app sigue funcionando sin romperse.
+ESTILOS = f"""
+<style>
+  :root {{
+    --verde: {VERDE};
+    --verde-oscuro: {VERDE_OSCURO};
+    --verde-tenue: {VERDE_TENUE};
+    --tinta: {TINTA};
+    --tinta-suave: {TINTA_SUAVE};
+    --rejilla: {REJILLA};
+  }}
+
+  /* Títulos con un acento de marca a la izquierda */
+  h1 {{
+    font-weight: 700 !important;
+    letter-spacing: -0.02em;
+    padding-left: 14px;
+    border-left: 5px solid var(--verde);
+    line-height: 1.15;
+  }}
+  h2, h3 {{ font-weight: 650 !important; color: var(--tinta); }}
+
+  /* Tarjetas de indicadores */
+  div[data-testid="stMetric"] {{
+    background: #ffffff;
+    border: 1px solid var(--rejilla);
+    border-top: 3px solid var(--verde);
+    border-radius: 12px;
+    padding: 14px 18px;
+    box-shadow: 0 1px 2px rgba(11, 11, 11, 0.04);
+  }}
+  div[data-testid="stMetricValue"] {{
+    font-size: 1.65rem;
+    font-weight: 700;
+    color: var(--tinta);
+  }}
+  div[data-testid="stMetricLabel"] {{
+    color: var(--tinta-suave);
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }}
+
+  /* Pestañas: la activa queda marcada en verde */
+  button[data-baseweb="tab"] {{ font-weight: 600; }}
+  div[data-baseweb="tab-highlight"] {{ background-color: var(--verde) !important; }}
+
+  /* Botones. Sobre el verde el texto va oscuro: en blanco no alcanza contraste */
+  div.stButton > button, div.stFormSubmitButton > button {{
+    background: var(--verde);
+    color: var(--tinta) !important;
+    border: 1px solid var(--verde-oscuro);
+    border-radius: 9px;
+    font-weight: 650;
+    transition: filter 120ms ease;
+  }}
+  div.stButton > button:hover, div.stFormSubmitButton > button:hover {{
+    filter: brightness(1.06);
+    border-color: var(--verde-oscuro);
+  }}
+  div[data-testid="stDownloadButton"] > button {{
+    background: #ffffff;
+    color: var(--tinta) !important;
+    border: 1px solid var(--rejilla);
+    border-radius: 9px;
+    font-weight: 600;
+  }}
+  div[data-testid="stDownloadButton"] > button:hover {{
+    border-color: var(--verde-oscuro);
+    background: var(--verde-tenue);
+  }}
+
+  /* Barra lateral */
+  section[data-testid="stSidebar"] {{ border-right: 1px solid var(--rejilla); }}
+  section[data-testid="stSidebar"] h2 {{
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--tinta-suave);
+  }}
+
+  /* Etiquetas de los filtros seleccionados */
+  span[data-baseweb="tag"] {{
+    background-color: var(--verde) !important;
+    color: var(--tinta) !important;
+  }}
+
+  /* Pantalla de ingreso y estado de carga */
+  .marca {{
+    display: flex; align-items: center; gap: 12px; margin-bottom: 4px;
+  }}
+  .marca-punto {{
+    width: 34px; height: 34px; border-radius: 10px;
+    background: var(--verde); flex: 0 0 auto;
+    display: grid; place-items: center; font-size: 1.1rem;
+  }}
+  .marca-texto {{
+    font-size: 1.32rem; font-weight: 700; color: var(--tinta);
+    letter-spacing: -0.01em; line-height: 1.2;
+  }}
+  .marca-sub {{ color: var(--tinta-suave); font-size: 0.9rem; margin: 2px 0 18px; }}
+
+  .cargando {{
+    border: 1px solid var(--rejilla);
+    border-radius: 14px;
+    background: #ffffff;
+    padding: 34px 32px;
+    max-width: 440px;
+    margin: 56px auto;
+    text-align: center;
+    box-shadow: 0 2px 10px rgba(11, 11, 11, 0.05);
+  }}
+  .cargando-titulo {{
+    font-size: 1.05rem; font-weight: 650; color: var(--tinta); margin-bottom: 6px;
+  }}
+  .cargando-nota {{ color: var(--tinta-suave); font-size: 0.86rem; }}
+  .cargando-pista {{
+    position: relative; height: 6px; border-radius: 99px;
+    background: var(--verde-tenue); overflow: hidden; margin: 20px 0 14px;
+  }}
+  .cargando-pista::after {{
+    content: ""; position: absolute; inset: 0;
+    width: 40%; border-radius: 99px; background: var(--verde);
+    animation: avance 1.1s ease-in-out infinite;
+  }}
+  @keyframes avance {{
+    0%   {{ transform: translateX(-105%); }}
+    100% {{ transform: translateX(255%); }}
+  }}
+  @media (prefers-reduced-motion: reduce) {{
+    .cargando-pista::after {{ animation: none; width: 100%; opacity: 0.55; }}
+  }}
+</style>
+"""
+st.markdown(ESTILOS, unsafe_allow_html=True)
+
+TARJETA_CARGANDO = """
+<div class="cargando">
+  <div class="cargando-titulo">Cargando registros</div>
+  <div class="cargando-nota">Consultando la base de datos…</div>
+  <div class="cargando-pista"></div>
+  <div class="cargando-nota">Puede tardar unos segundos la primera vez del día.</div>
+</div>
+"""
+
+
+def encabezado_marca(subtitulo: str) -> None:
+    st.markdown(
+        f"""
+        <div class="marca">
+          <div class="marca-punto">🚜</div>
+          <div class="marca-texto">Labores de maquinaria</div>
+        </div>
+        <div class="marca-sub">{subtitulo}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 if not (SUPABASE_URL and SUPABASE_KEY):
     st.error(
@@ -521,7 +731,10 @@ with st.sidebar:
         cerrar_sesion()
         st.rerun()
 
-datos = obtener_datos(token)
+marcador_carga = st.empty()
+marcador_carga.markdown(TARJETA_CARGANDO, unsafe_allow_html=True)
+datos = obtener_datos(st.session_state["sesion"]["id"], token)
+marcador_carga.empty()
 
 if datos.empty:
     st.title("Registro diario de labores de maquinaria")
@@ -583,7 +796,7 @@ st.title("Registro diario de labores de maquinaria")
 st.caption(
     f"{len(filtrados)} de {len(datos)} registros · último registro recibido: "
     + (
-        datos["registrado_en"].max().strftime("%d/%m/%Y %H:%M")
+        datos["registrado_en"].max().strftime(FORMATO_FECHA + " %H:%M")
         if "registrado_en" in datos.columns and datos["registrado_en"].notna().any()
         else "sin dato"
     )
@@ -601,7 +814,7 @@ columnas_kpi[3].metric("Operadores", filtrados["nombre_completo"].nunique())
 columnas_kpi[4].metric("Equipos", filtrados["ip_equipo"].nunique())
 columnas_kpi[5].metric("Con alerta", int(filtrados["tiene_alerta"].sum()))
 
-resumen, detalle, calidad = st.tabs(["Resumen", "Detalle", "Calidad de datos"])
+detalle, resumen, calidad = st.tabs(["Detalle", "Resumen", "Calidad de datos"])
 
 with resumen:
     izquierda, derecha = st.columns(2)
@@ -618,7 +831,7 @@ with resumen:
     por_hacienda = filtrados.groupby("hda", as_index=False)["horas_trabajadas"].sum()
     derecha.plotly_chart(
         barras_horizontales(por_hacienda, "hda", "horas_trabajadas",
-                            "Horas trabajadas por hacienda", "horas", color=NARANJA),
+                            "Horas trabajadas por hacienda", "horas"),
         width="stretch",
     )
 
@@ -629,7 +842,7 @@ with resumen:
     por_actividad = filtrados.groupby("actividad", as_index=False)["area_trabajada"].sum()
     izquierda.plotly_chart(
         barras_horizontales(por_actividad, "actividad", "area_trabajada",
-                            "Área trabajada por actividad", "ha", color=AQUA),
+                            "Área trabajada por actividad", "ha"),
         width="stretch",
     )
 

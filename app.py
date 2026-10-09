@@ -94,7 +94,7 @@ ETIQUETAS = {
     "registrado_en": "Fecha digitación",
 }
 
-FORMATO_FECHA = "%d/%m/%Y"  # fecha y fecha de digitación se muestran igual
+FORMATO_FECHA = "%d/%m/%y"  # DD/MM/AA, igual en fecha y fecha de digitación
 
 # Columnas que se piden a la base. Se excluyen las internas (id_registro,
 # fecha_original, telegram_chat_id, telegram_usuario): no se muestran nunca.
@@ -203,8 +203,12 @@ def normalizar(df: pd.DataFrame) -> pd.DataFrame:
 
     if "registrado_en" in df.columns:
         # El bot guarda en UTC; se muestra en hora de Colombia (UTC-5).
+        # format="ISO8601" es necesario: Postgres recorta los microsegundos en
+        # cero, así que la misma columna trae "...02.384+00" y "...00+00". Con
+        # inferencia automática pandas toma el formato de la primera fila y
+        # convierte el resto a NaT, dejando la fecha de digitación en blanco.
         df["registrado_en"] = pd.to_datetime(
-            df["registrado_en"], errors="coerce", utc=True
+            df["registrado_en"], errors="coerce", utc=True, format="ISO8601"
         ).dt.tz_localize(None) - pd.Timedelta(hours=5)
 
     inicio = _a_horas(df["hora_inicio"]) if "hora_inicio" in df.columns else pd.Series(index=df.index, dtype=float)
@@ -578,7 +582,7 @@ def barras_por_dia(datos: pd.DataFrame, titulo: str):
             textposition="outside",
             textfont=dict(color=TINTA_SUAVE, size=12),
             cliponaxis=False,
-            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>%{y:,.2f} horas<extra></extra>",
+            hovertemplate="<b>%{x|%d/%m/%y}</b><br>%{y:,.2f} horas<extra></extra>",
         )
     )
     fig.update_xaxes(showgrid=False, title=None, tickformat="%d/%m", dtick="D1")
@@ -603,12 +607,36 @@ def a_csv(tabla: pd.DataFrame) -> bytes:
 
 
 def para_mostrar(df: pd.DataFrame, columnas: list[str] | None = None) -> pd.DataFrame:
+    """Tabla lista para `st.dataframe`, con las fechas como fechas reales.
+
+    No se convierten a texto a propósito: si lo fueran, al hacer clic en el
+    encabezado la tabla ordenaría alfabéticamente y mandaría el día antes que
+    el mes. El formato DD/MM/AA lo aplica CONFIG_COLUMNAS en la presentación,
+    de modo que el orden sigue siendo cronológico.
+    """
     columnas = [c for c in (columnas or df.columns) if c in df.columns]
-    tabla = df[columnas].copy()
-    for columna in ("fecha", "registrado_en"):
+    return df[columnas].copy().rename(columns=ETIQUETAS)
+
+
+def para_exportar(tabla: pd.DataFrame) -> pd.DataFrame:
+    """Copia con las fechas ya formateadas, para Excel y CSV."""
+    tabla = tabla.copy()
+    for columna in (ETIQUETAS["fecha"], ETIQUETAS["registrado_en"]):
         if columna in tabla.columns:
             tabla[columna] = tabla[columna].dt.strftime(FORMATO_FECHA)
-    return tabla.rename(columns=ETIQUETAS)
+    return tabla
+
+
+# Formato de las columnas de fecha en las tablas. Streamlit muestra DD/MM/AA y
+# ordena por el valor real al hacer clic en el encabezado.
+CONFIG_COLUMNAS = {
+    ETIQUETAS["fecha"]: st.column_config.DateColumn(
+        ETIQUETAS["fecha"], format="DD/MM/YY"
+    ),
+    ETIQUETAS["registrado_en"]: st.column_config.DatetimeColumn(
+        ETIQUETAS["registrado_en"], format="DD/MM/YY"
+    ),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -1003,19 +1031,25 @@ with detalle:
     st.subheader("Registros")
     columnas_detalle = [c for c in ORDEN_COLUMNAS if c in filtrados.columns] + ["registrado_en"]
     vista = para_mostrar(filtrados, columnas_detalle)
-    st.dataframe(vista, hide_index=True, width="stretch", height=520)
+    st.dataframe(
+        vista,
+        hide_index=True,
+        width="stretch",
+        height=520,
+        column_config=CONFIG_COLUMNAS,
+    )
 
     descarga_1, descarga_2 = st.columns(2)
     descarga_1.download_button(
         "Descargar Excel",
-        a_excel({"Registros": vista}),
+        a_excel({"Registros": para_exportar(vista)}),
         file_name="labores_maquinaria.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
     descarga_2.download_button(
         "Descargar CSV",
-        a_csv(vista),
+        a_csv(para_exportar(vista)),
         file_name="labores_maquinaria.csv",
         mime="text/csv",
         width="stretch",
@@ -1049,6 +1083,7 @@ with calidad:
                     para_mostrar(afectados, [c for c in ORDEN_COLUMNAS if c in afectados.columns]),
                     hide_index=True,
                     width="stretch",
+                    column_config=CONFIG_COLUMNAS,
                 )
 
     st.subheader("Observaciones de los operadores")
@@ -1063,4 +1098,5 @@ with calidad:
             ),
             hide_index=True,
             width="stretch",
+            column_config=CONFIG_COLUMNAS,
         )

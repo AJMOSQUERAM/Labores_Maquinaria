@@ -16,7 +16,8 @@ Operador (Telegram)
       ▼
    Flujo n8n ──────────► Supabase / Postgres
                           ├── registro_labores_maquinaria   (registros del bot)
-                          └── actividades                   (maestra de labores)
+                          ├── actividades                   (maestra de labores)
+                          └── Maestro_Equipos_Zonas         (maestra de equipos)
                                     │
                                     ▼
                           app.py (Streamlit)
@@ -44,7 +45,9 @@ Streamlit re-ejecuta `app.py` completo en cada interacción. El orden importa:
    `pantalla_ingreso()` y `st.stop()` corta ahí.
 3. **Carga** — `obtener_datos(token)` → `cargar_registros()` (cacheada).
 4. **Normalización** — `normalizar()` convierte tipos y deriva columnas.
-5. **Enriquecimiento** — `agregar_actividades()` traduce el código de labor.
+5. **Enriquecimiento** — `agregar_actividades()` traduce el código de labor y
+   `agregar_zonas()` cruza el equipo contra la maestra para traer zona y
+   descripción.
 6. **Validación** — `marcar_alertas()` produce la matriz booleana de reglas.
 7. **Filtros** — la barra lateral recorta el DataFrame a `filtrados`.
 8. **Render** — tres pestañas: Detalle, Resumen, Calidad de datos.
@@ -97,6 +100,20 @@ login funciona pero no llega ninguna fila. Ese caso se detecta explícitamente e
 Las políticas RLS y las cuentas de usuario se administran directamente en
 Supabase; no forman parte de este repositorio.
 
+### Alcance
+
+Todo usuario autenticado lee todos los registros. La **zona es un filtro de
+visualización** en la barra lateral, no un permiso: sirve para que cada persona
+se concentre en su área, no para impedirle ver las demás.
+
+La restricción por usuario quedó preparada pero no activa. Está documentada en
+la sección 8 de `supabase_politicas_lectura.sql`: una política que cruza el
+equipo del registro contra `Maestro_Equipos_Zonas` y lo compara con el arreglo
+`zonas` del `app_metadata` del usuario, leído del token. Se dejó fuera porque
+falla cerrado — quien no tenga zona asignada no vería ninguna fila —, y eso
+bloquearía a los usuarios aún sin mapear. Para activarla hay que asignar primero
+la zona a todos (`supabase_asignar_zonas.sql`) y después cambiar la política.
+
 ---
 
 ## Caché
@@ -107,6 +124,7 @@ Supabase; no forman parte de este repositorio.
 |---|---|---|
 | `cargar_registros` | 300 s | `(tabla, usuario_id)` |
 | `cargar_actividades` | 3600 s | `(tabla, códigos presentes, usuario_id)` |
+| `cargar_zonas` | 3600 s | `(tabla, usuario_id)` |
 
 El `usuario_id` forma parte de la clave para que un usuario no reciba datos
 traídos con las credenciales de otro. El **token no entra en la clave**: se pasa
@@ -171,7 +189,22 @@ lista `ORDEN_COLUMNAS` define qué se ve y en qué orden.
 | `horas_calendario` | `hora_final − hora_inicio` en horas decimales; suma 24 si cruza medianoche. Es la referencia para contrastar `horas_trabajadas`. |
 | `clave` | Concatenación de `ficha`, `fecha`, `hora_inicio` y `labor`. Identificador estable de una fila. |
 | `actividad` | Nombre de la labor, resuelto contra la maestra. |
+| `zona`, `nombre_equipo` | Zona y descripción del equipo, resueltas contra `Maestro_Equipos_Zonas`. |
 | `tiene_alerta`, `detalle_alertas` | Resumen de `marcar_alertas()`. |
+
+### Cruce con la maestra de equipos
+
+`ip_equipo` se cruza contra `Maestro_Equipos_Zonas` (`Cod_equipo` → `Zona`,
+`D_equipo`) en `agregar_zonas()`. Dos detalles del cruce:
+
+- La llave se normaliza a mayúsculas y sin espacios en ambos lados. Los códigos
+  provienen de capturas distintas y no siempre coinciden en caja.
+- El cruce es por la izquierda: un equipo ausente de la maestra **conserva su
+  registro** y queda en `Sin zona`, con el código como descripción. Nunca se
+  pierde una fila por un faltante del maestro.
+
+El nombre de la tabla lleva mayúsculas y PostgREST es sensible a ellas, igual
+que sus columnas (`Cod_equipo`, `D_equipo`, `Zona`).
 
 ### Traducción de labores
 

@@ -3,7 +3,7 @@
 .streamlit/secrets.toml
 
 # Configuración interna de la base de datos: se conserva en local, no se publica
-supabase_politicas_lectura.sql
+supabase_*.sql
 
 # Exportaciones de datos: nunca deben publicarse
 *.csv

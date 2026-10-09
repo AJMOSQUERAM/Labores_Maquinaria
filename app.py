@@ -42,6 +42,9 @@ SUPABASE_KEY = _config("SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_AN
 SUPABASE_TABLA = _config("SUPABASE_TABLE", defecto="registro_labores_maquinaria")
 # Maestra de labores: el campo `labor` de cada registro es el código de la actividad.
 ACTIVIDADES_TABLA = _config("SUPABASE_ACTIVIDADES_TABLE", defecto="actividades")
+# Maestra de equipos: asocia cada código de equipo con su descripción y su zona.
+# El nombre lleva mayúsculas y PostgREST es sensible a ellas.
+ZONAS_TABLA = _config("SUPABASE_ZONAS_TABLE", defecto="Maestro_Equipos_Zonas")
 
 # Paleta de marca, validada para fondo claro.
 #
@@ -69,6 +72,8 @@ ETIQUETAS = {
     "ficha": "Ficha",
     "nombre_completo": "Operador",
     "ip_equipo": "Equipo",
+    "nombre_equipo": "Descripción equipo",
+    "zona": "Zona",
     "tiene_implemento": "Con implemento",
     "cantidad_implementos": "N° implementos",
     "implemento_1": "Implemento 1",
@@ -124,6 +129,7 @@ COLUMNAS_TEXTO = [
 # Orden de columnas en las tablas de detalle.
 ORDEN_COLUMNAS = [
     "fecha",
+    "zona",
     "labor",
     "actividad",
     "hda",
@@ -131,6 +137,7 @@ ORDEN_COLUMNAS = [
     "ficha",
     "nombre_completo",
     "ip_equipo",
+    "nombre_equipo",
     "implemento_1",
     "implemento_2",
     "hora_inicio",
@@ -300,6 +307,64 @@ def cargar_actividades(
     return maestro.drop_duplicates(subset="codigo")
 
 
+SIN_ZONA = "Sin zona"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cargar_zonas(tabla: str, usuario_id: str, _token: str) -> pd.DataFrame:
+    """Maestra de equipos: código, descripción y zona."""
+    maestro = _descargar(tabla, usuario_id, _token, "Cod_equipo,D_equipo,Zona")
+    if maestro.empty:
+        return maestro
+    maestro = maestro.rename(
+        columns={"Cod_equipo": "codigo_equipo", "D_equipo": "nombre_equipo", "Zona": "zona"}
+    )
+    for columna in ("codigo_equipo", "nombre_equipo", "zona"):
+        if columna in maestro.columns:
+            # Las tres columnas de la maestra son nullable: un NULL llegaría como
+            # el texto "None" y se mostraría tal cual en el filtro.
+            maestro[columna] = (
+                maestro[columna]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": "", "None": "", "<NA>": "", "null": ""})
+            )
+    # La llave de cruce se normaliza a mayúsculas: los códigos vienen de dos
+    # capturas distintas y no siempre coinciden en caja.
+    maestro["llave"] = maestro["codigo_equipo"].str.upper()
+    return maestro.drop_duplicates(subset="llave")
+
+
+def agregar_zonas(df: pd.DataFrame, usuario_id: str, token: str) -> pd.DataFrame:
+    """Cruza el equipo del registro contra la maestra para traer zona y descripción."""
+    df = df.copy()
+    df["zona"] = SIN_ZONA
+    df["nombre_equipo"] = df.get("ip_equipo", "")
+
+    if "ip_equipo" not in df.columns:
+        return df
+    try:
+        maestro = cargar_zonas(ZONAS_TABLA, usuario_id, token)
+    except Exception as error:
+        st.warning(f"No se pudo leer la maestra de equipos y zonas: {error}")
+        return df
+    if maestro.empty:
+        st.warning(
+            f"No se pudo leer «{ZONAS_TABLA}»: los registros quedan sin zona. "
+            "Revise la política de lectura de esa tabla."
+        )
+        return df
+
+    llaves = df["ip_equipo"].astype(str).str.strip().str.upper()
+    zonas = dict(zip(maestro["llave"], maestro["zona"]))
+    nombres = dict(zip(maestro["llave"], maestro["nombre_equipo"]))
+    # Un equipo que no esté en la maestra conserva su registro y queda en
+    # "Sin zona": nunca se pierde una fila por un faltante del maestro.
+    df["zona"] = llaves.map(zonas).replace("", pd.NA).fillna(SIN_ZONA)
+    df["nombre_equipo"] = llaves.map(nombres).replace("", pd.NA).fillna(df["ip_equipo"])
+    return df
+
+
 def agregar_actividades(df: pd.DataFrame, usuario_id: str, token: str) -> pd.DataFrame:
     """Traduce el código de `labor` al nombre de la actividad usando la tabla maestra."""
     df = df.copy()
@@ -344,7 +409,8 @@ def obtener_datos(usuario_id: str, token: str) -> pd.DataFrame:
         )
         return pd.DataFrame()
 
-    return agregar_actividades(normalizar(datos), usuario_id, token)
+    datos = agregar_actividades(normalizar(datos), usuario_id, token)
+    return agregar_zonas(datos, usuario_id, token)
 
 
 # --------------------------------------------------------------------------- #
@@ -370,6 +436,7 @@ def cerrar_sesion() -> None:
     except Exception:  # cerrar la sesión local es lo que importa
         pass
     st.session_state.pop("sesion", None)
+    st.session_state.pop("datos_listos", None)
     st.cache_data.clear()
 
 
@@ -731,10 +798,16 @@ with st.sidebar:
         cerrar_sesion()
         st.rerun()
 
+# La tarjeta se muestra solo mientras no haya datos en la sesión. En los reruns
+# por cambio de filtro los datos vienen de la caché, y hacerla aparecer daba la
+# impresión de que la app volvía a consultar la base.
 marcador_carga = st.empty()
-marcador_carga.markdown(TARJETA_CARGANDO, unsafe_allow_html=True)
+if not st.session_state.get("datos_listos"):
+    marcador_carga.markdown(TARJETA_CARGANDO, unsafe_allow_html=True)
 datos = obtener_datos(st.session_state["sesion"]["id"], token)
 marcador_carga.empty()
+if not datos.empty:
+    st.session_state["datos_listos"] = True
 
 if datos.empty:
     st.title("Registro diario de labores de maquinaria")
@@ -767,18 +840,39 @@ with st.sidebar:
         return st.multiselect(etiqueta, opciones, placeholder="Todos")
 
     operadores = multiselector("nombre_completo", "Operador")
-    haciendas = multiselector("hda", "Hacienda")
     suertes = multiselector("ste", "Suerte")
     actividades = multiselector("actividad", "Actividad")
     equipos = multiselector("ip_equipo", "Equipo")
     solo_alertas = st.checkbox("Sólo registros con alerta")
     solo_observaciones = st.checkbox("Sólo registros con observación")
+    st.caption("Los filtros de Zona y Hacienda están en la pestaña Detalle y aplican a todo el tablero.")
+
+# Opciones tomadas del conjunto completo, para que no cambien al filtrar.
+def _opciones(columna: str) -> list[str]:
+    if columna not in datos.columns:
+        return []
+    return sorted(v for v in datos[columna].dropna().unique() if str(v).strip())
+
+
+ZONAS_DISPONIBLES = _opciones("zona")
+HACIENDAS_DISPONIBLES = _opciones("hda")
+
+
+# Los selectores se dibujan en la pestaña Detalle; Streamlit deja su valor en
+# session_state antes de ejecutar el script, así que aquí ya están disponibles.
+def _seleccion(clave: str, validas: list[str]) -> list[str]:
+    return [v for v in (st.session_state.get(clave) or []) if v in validas]
+
+
+zonas = _seleccion("filtro_zona", ZONAS_DISPONIBLES)
+haciendas = _seleccion("filtro_hacienda", HACIENDAS_DISPONIBLES)
 
 filtrados = datos.copy()
 if rango and isinstance(rango, (list, tuple)) and len(rango) == 2:
     desde, hasta = pd.Timestamp(rango[0]), pd.Timestamp(rango[1])
     filtrados = filtrados[filtrados["fecha"].between(desde, hasta) | filtrados["fecha"].isna()]
 for columna, seleccion in [
+    ("zona", zonas),
     ("nombre_completo", operadores),
     ("hda", haciendas),
     ("ste", suertes),
@@ -811,12 +905,19 @@ columnas_kpi[0].metric("Registros", f"{len(filtrados):,}".replace(",", "."))
 columnas_kpi[1].metric("Horas trabajadas", f"{filtrados['horas_trabajadas'].sum():,.1f}")
 columnas_kpi[2].metric("Área trabajada (ha)", f"{filtrados['area_trabajada'].sum():,.2f}")
 columnas_kpi[3].metric("Operadores", filtrados["nombre_completo"].nunique())
-columnas_kpi[4].metric("Equipos", filtrados["ip_equipo"].nunique())
+columnas_kpi[4].metric("Zonas", filtrados["zona"].nunique())
 columnas_kpi[5].metric("Con alerta", int(filtrados["tiene_alerta"].sum()))
 
 detalle, resumen, calidad = st.tabs(["Detalle", "Resumen", "Calidad de datos"])
 
 with resumen:
+    por_zona = filtrados.groupby("zona", as_index=False)["horas_trabajadas"].sum()
+    st.plotly_chart(
+        barras_horizontales(por_zona, "zona", "horas_trabajadas",
+                            "Horas trabajadas por zona", "horas"),
+        width="stretch",
+    )
+
     izquierda, derecha = st.columns(2)
 
     por_operador = (
@@ -846,9 +947,13 @@ with resumen:
         width="stretch",
     )
 
-    por_equipo = filtrados.groupby("ip_equipo", as_index=False)["horas_trabajadas"].sum().head(20)
+    por_equipo = (
+        filtrados.groupby("nombre_equipo", as_index=False)["horas_trabajadas"]
+        .sum()
+        .nlargest(15, "horas_trabajadas")
+    )
     derecha.plotly_chart(
-        barras_horizontales(por_equipo, "ip_equipo", "horas_trabajadas",
+        barras_horizontales(por_equipo, "nombre_equipo", "horas_trabajadas",
                             "Horas trabajadas por equipo", "horas"),
         width="stretch",
     )
@@ -879,6 +984,22 @@ with resumen:
     st.dataframe(tabla_operador, hide_index=True, width="stretch")
 
 with detalle:
+    col_zona, col_hacienda = st.columns(2)
+    col_zona.multiselect(
+        "Zona",
+        ZONAS_DISPONIBLES,
+        key="filtro_zona",
+        placeholder="Todas las zonas",
+        help="Filtra los equipos por zona. Aplica también a Resumen y Calidad de datos.",
+    )
+    col_hacienda.multiselect(
+        "Hacienda",
+        HACIENDAS_DISPONIBLES,
+        key="filtro_hacienda",
+        placeholder="Todas las haciendas",
+        help="Aplica también a Resumen y Calidad de datos.",
+    )
+
     st.subheader("Registros")
     columnas_detalle = [c for c in ORDEN_COLUMNAS if c in filtrados.columns] + ["registrado_en"]
     vista = para_mostrar(filtrados, columnas_detalle)
